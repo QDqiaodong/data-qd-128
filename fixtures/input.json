@@ -1,0 +1,37 @@
+{
+  "window_seconds": 10,
+  "out_of_order_seconds": 5,
+  "flush": true,
+  "events": [
+    {
+      "id": "A",
+      "event_time": 1,
+      "value": 2
+    },
+    {
+      "id": "B",
+      "event_time": 12,
+      "value": 3
+    },
+    {
+      "id": "C",
+      "event_time": 8,
+      "value": 4
+    },
+    {
+      "id": "D",
+      "event_time": 20,
+      "value": 5
+    },
+    {
+      "id": "E",
+      "event_time": 4,
+      "value": 9
+    },
+    {
+      "id": "B",
+      "event_time": 12,
+      "value": 3
+    }
+  ]
+}
