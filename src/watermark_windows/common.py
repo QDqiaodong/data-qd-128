@@ -1,6 +1,27 @@
 """Strict local JSON contract and atomic report publication."""
+from contextlib import contextmanager
 from pathlib import Path
-import hashlib, json, os, tempfile
+from urllib.parse import quote
+import fcntl, hashlib, json, os, sqlite3, tempfile, time
+
+class EpochChanged(ValueError):
+    """The erase epoch changed between snapshot and publication."""
+
+def gate(name):
+    """Test-only rendezvous point; inert unless WATERMARK_GATE_DIR is set.
+
+    The process announces arrival by creating <name>.reached.  It then blocks
+    until <name>.release appears, but only for names listed in the optional
+    comma-separated WATERMARK_GATE_BLOCK (default: block on every gate).
+    """
+    directory=os.environ.get('WATERMARK_GATE_DIR')
+    if not directory:return
+    root=Path(directory)
+    (root/(name+'.reached')).write_text('1')
+    block=os.environ.get('WATERMARK_GATE_BLOCK')
+    if block is not None and name not in block.split(','):return
+    release=root/(name+'.release')
+    while not release.exists():time.sleep(0.005)
 
 def require(obj,keys):
     if not isinstance(obj,dict) or set(obj)!=set(keys.split()):raise ValueError('expected object fields: '+keys)
@@ -45,3 +66,79 @@ def save(path,report):
         os.replace(temp,dest)
     finally:
         if temp and os.path.exists(temp):os.unlink(temp)
+
+def _read_only(path):
+    return sqlite3.connect('file:%s?mode=ro'%quote(str(Path(path).resolve()),safe='/'),uri=True,isolation_level=None)
+
+def read_epoch(path):
+    """Erase epoch of one state database; schema 1 states have no epoch and report 0."""
+    p=Path(path)
+    if not p.exists():raise ValueError('state not initialized: '+str(p))
+    try:conn=_read_only(p)
+    except sqlite3.Error as error:raise ValueError(str(error))
+    try:
+        try:row=conn.execute("SELECT value FROM meta WHERE key='erase_epoch'").fetchone()
+        except sqlite3.Error:raise ValueError('not a stream state database: '+str(p))
+        return 0 if row is None else int(json.loads(row[0]))
+    finally:conn.close()
+
+def _lock_fds(paths,exclusive):
+    """Open and flock each distinct resolved path, in sorted order (deadlock-free)."""
+    fds=[]
+    try:
+        for p in sorted({str(Path(q).resolve()) for q in paths}):
+            try:fd=os.open(p,os.O_RDONLY)
+            except OSError as error:raise ValueError('cannot lock state: '+str(error))
+            try:fcntl.flock(fd,fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            except OSError:
+                os.close(fd);raise
+            fds.append(fd)
+    except BaseException:
+        for fd in fds:
+            try:fcntl.flock(fd,fcntl.LOCK_UN)
+            finally:os.close(fd)
+        raise
+    return fds
+
+def _unlock_fds(fds):
+    for fd in fds:
+        try:fcntl.flock(fd,fcntl.LOCK_UN)
+        finally:os.close(fd)
+
+@contextmanager
+def state_lock(paths,exclusive=False):
+    """Advisory whole-file lock on every distinct resolved state path.
+
+    Writers (apply, erase) take exclusive locks; readers that publish take
+    shared locks.  Locking the resolved database file means path aliases
+    (relative paths, symlinks, hard links) contend on the same inode.
+    """
+    fds=_lock_fds(paths,exclusive)
+    try:yield
+    finally:_unlock_fds(fds)
+
+@contextmanager
+def publication_guard(epochs):
+    """Hold shared state locks and re-verify erase epochs before publishing.
+
+    `epochs` is a mapping or an iterable of (state path, epoch) pairs observed in
+    the snapshots the report was computed from.  The same resolved state may
+    appear twice (e.g. one database used on both sides of a reconciliation): both
+    observations must agree, otherwise the report is stale across its own reads.
+    Shared locks are held while the caller replaces the report file and writes
+    stdout, so an erase (which needs the exclusive lock) cannot commit in that
+    window.  A changed epoch raises EpochChanged: the caller must leave the old
+    report in place and exit 2.
+    """
+    pairs=epochs.items() if hasattr(epochs,'items') else epochs
+    expected={}
+    for path,epoch in pairs:
+        key=str(Path(path).resolve())
+        if key in expected and expected[key]!=int(epoch):
+            raise EpochChanged('erase epoch changed between snapshots; report not published')
+        expected[key]=int(epoch)
+    with state_lock(list(expected)):
+        for path,epoch in expected.items():
+            if read_epoch(path)!=epoch:
+                raise EpochChanged('erase epoch changed; report not published')
+        yield

@@ -23,9 +23,13 @@ python3 -m venv .venv
 输出是可独立读取的JSON；成功后原子替换，输入/计算失败退出2并保留旧报告。
 输入和输出不得相同，输出符号链接拒绝。单操作者批处理，不承诺并发发布或断电恢复。
 同输入重跑不累加。测试使用临时目录，运行产物在忽略的run/。
+`common.gate` 为**仅测试用**会合点：仅在设置 `WATERMARK_GATE_DIR` 时生效（`*.reached`
+到达标记，按 `WATERMARK_GATE_BLOCK` 列出的名字等待 `*.release`），未设置时完全无操作；
+双进程门控测试用它确定性地冻结发布窗口。
 
-src/watermark_windows/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON及报告发布，
-cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、整批事务、水位推进与报告重建）；
+src/watermark_windows/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON、
+报告发布与擦除epoch发布门控；cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、
+整批事务、水位推进、逻辑擦除与报告重建）；
 reconcile.py 为跨源对账（只读快照、Hirschberg线性空间双目标配对）；
 audit.py 为内部发布审计（只读快照、精确秩分支定界最小损失抑制）。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
@@ -48,6 +52,24 @@ audit.py 为内部发布审计（只读快照、精确秩分支定界最小损�
 全局水位取活跃分区局部水位最小值，未见事件分区阻塞、全idle不推进、resume不回退。
 apply提交后发布报告；提交后发布前中断时用report仅凭数据库恢复，报告与不中断逐字节一致；结束不flush。
 上述样例批接受5条总和15，水位15，窗口[0,10)按watermark关闭（count2/sum3），[10,20)与[20,30)保持pending。
+
+## 逻辑擦除与防复活（stream erase）
+
+按事件ID整批逻辑擦除，整批事务提交后发布报告，契约详见 [流式数据契约](docs/stream.md)。
+
+```sh
+echo '{"event_ids": ["C"]}' > run/erase.json
+.venv/bin/watermark-windows stream erase --db run/state.db --ids run/erase.json --output run/stream-report.json
+```
+
+一次提交内清除`seen`/`late_events`明文payload、扣除窗口贡献、清除已提交记录的明文
+（保留规范记录SHA256），写入永久墓碑并推进`erase_epoch`；重复擦除幂等，未知ID整批回滚。
+闭窗不重开、空窗保留，水位/offset不回退；已擦除ID在任何分区的新offset上整批拒绝，
+旧offset同摘要重传仍是无操作、冲突则失败。不要求介质抹除，配对/抑制算法不变。
+schema 1 状态库首次 apply/report/erase 时在单事务内原地迁移到schema 2（失败则回滚保持schema 1）。
+reconcile与audit只读快照排除墓碑ID，报告带各自快照的erase epoch；计算后若epoch变化，
+退出2、不替换文件、不写stdout（保留旧报告）。epoch校验与报告替换及stdout在同一共享
+文件锁内，擦除提交须等待；按解析路径加锁，同库路径别名同样协调。
 
 ## 跨源对账（reconcile）
 

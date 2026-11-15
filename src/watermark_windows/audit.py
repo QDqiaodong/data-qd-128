@@ -33,7 +33,7 @@ import argparse, hashlib, json, sqlite3, sys
 from fractions import Fraction
 from pathlib import Path
 from urllib.parse import quote
-from .common import ident, number, require, read, save
+from .common import ident, number, require, read, save, gate, publication_guard
 from .reconcile import canonical
 
 MAX_EVENTS=80
@@ -41,7 +41,7 @@ MAX_QUERIES=22
 MOD=(1<<61)-1  # prime; see the module docstring for the exactness argument
 
 def _snapshot(path):
-    """Accepted events and late ids of one stream state under a consistent read-only snapshot."""
+    """Accepted events, late ids, erased tombstone ids and erase epoch by consistent snapshot."""
     p=Path(path)
     if not p.exists():raise ValueError('state not initialized: '+str(p))
     conn=sqlite3.connect('file:%s?mode=ro'%quote(str(p.resolve()),safe='/'),uri=True,isolation_level=None)
@@ -50,21 +50,30 @@ def _snapshot(path):
         try:row=conn.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
         except sqlite3.Error:
             raise ValueError('not a stream state database: '+str(p))
-        if row is None or json.loads(row[0])!=1:raise ValueError('unsupported state schema: '+str(p))
+        if row is None or json.loads(row[0]) not in (1,2):
+            raise ValueError('unsupported state schema: '+str(p))
+        schema=json.loads(row[0])
+        epoch_row=conn.execute("SELECT value FROM meta WHERE key='erase_epoch'").fetchone()
+        epoch=0 if epoch_row is None else int(json.loads(epoch_row[0]))
+        tombstone_guard=" AND NOT EXISTS (SELECT 1 FROM tombstones t WHERE t.id=c.id)" if schema>=2 else ""
         events=conn.execute('SELECT c.id, s.event_time, s.value FROM contributions c '
-                            'JOIN seen s ON s.id=c.id ORDER BY c.seq').fetchall()
-        total=conn.execute('SELECT COUNT(*) FROM contributions').fetchone()[0]
+                            'JOIN seen s ON s.id=c.id WHERE 1=1%s ORDER BY c.seq'%tombstone_guard).fetchall()
+        total=conn.execute('SELECT COUNT(*) FROM contributions c WHERE 1=1%s'%tombstone_guard).fetchone()[0]
         if total!=len(events):raise ValueError('corrupt state: contribution without accepted event: '+str(p))
         late={r[0] for r in conn.execute('SELECT id FROM late_events')}
+        if schema>=2:
+            erased={r[0] for r in conn.execute('SELECT id FROM tombstones')}
+            late-=erased  # defense in depth: erased ids are gone from both, and never referenced
+        else:erased=set()
         conn.execute('COMMIT')
     finally:conn.close()
-    return canonical([(eid,moment,value) for eid,moment,value in events]),late
+    return canonical([(eid,moment,value) for eid,moment,value in events]),late,erased,epoch
 
 def _bounded(value,limit,what):
     if not isinstance(value,list) or len(value)>limit:raise ValueError('expected array of at most %d %s'%(limit,what))
     return value
 
-def _load_plan(path,known,late):
+def _load_plan(path,known,late,erased):
     """Validate the plan against the accepted event set; return queries sorted by query_id."""
     data,_=read(path)
     require(data,'queries protected_ids')
@@ -73,6 +82,7 @@ def _load_plan(path,known,late):
     def ref(eid):
         ident(eid)
         if eid not in known:
+            if eid in erased:raise ValueError('plan references erased event: '+eid)
             if eid in late:raise ValueError('plan references late event: '+eid)
             raise ValueError('plan references unknown event: '+eid)
     seen=set();parsed=[]
@@ -199,10 +209,15 @@ def _canonical_sha256(events,queries,protected):
 
 def audit(db,plan_path):
     """Run the audit over one stream state database and one JSON plan; return the report."""
-    events,late=_snapshot(db)
+    report,epoch=_audit(db,plan_path)
+    return report
+
+def _audit(db,plan_path):
+    """Run the audit and also return the erase epoch of the snapshot it used."""
+    events,late,erased,epoch=_snapshot(db)
     if len(events)>MAX_EVENTS:raise ValueError('audit supports at most %d accepted events'%MAX_EVENTS)
     known={eid for eid,_,_ in events}
-    queries,protected=_load_plan(plan_path,known,late)
+    queries,protected=_load_plan(plan_path,known,late,erased)
     n=len(events);ids=[eid for eid,_,_ in events];index={eid:k for k,eid in enumerate(ids)}
     incidence=[];sums=[]
     for qid,cost,members in queries:
@@ -241,6 +256,7 @@ def audit(db,plan_path):
         if d is None:raise ValueError('internal: kept plan identifies protected event')
         kept_plan.append({'event_id':eid,'kernel_certificate':_sparse(d,ids)})
     return {'schema_version':1,'input_sha256':_canonical_sha256(events,queries,protected),
+            'erase_epoch':epoch,
             'publication':{'event_ids':ids,
                            'kept_queries':[{'query_id':qid,'cost':cost,'event_ids':members,'sum':sums[j]}
                                            for j,(qid,cost,members) in enumerate(queries) if qid not in suppressed]},
@@ -248,7 +264,7 @@ def audit(db,plan_path):
                            'suppressed_queries':[{'query_id':qid,'cost':cost,'event_ids':members}
                                                  for qid,cost,members in queries if qid in suppressed]},
             'original_plan':{'per_event':original},
-            'kept_plan':{'per_event':kept_plan}}
+            'kept_plan':{'per_event':kept_plan}},epoch
 
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='watermark-windows audit',description=__doc__.splitlines()[0])
@@ -259,10 +275,15 @@ def main(argv=None):
     try:
         out=args.output.resolve()
         if out==args.db.resolve() or out==args.plan.resolve():raise ValueError('output would overwrite input')
-        report=audit(args.db,args.plan)
-        save(args.output,report)
+        report,epoch=_audit(args.db,args.plan)
+        gate('snapshot-taken')
+        with publication_guard({args.db:epoch}):
+            gate('validated')
+            save(args.output,report)
+            gate('saved')
+            print(json.dumps(report,sort_keys=True,ensure_ascii=False,allow_nan=False),flush=True)
     except (ValueError,TypeError,KeyError,OSError,OverflowError,RecursionError,sqlite3.Error) as error:
         print(str(error),file=sys.stderr);return 2
-    print(json.dumps(report,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+    return 0
 
 if __name__=='__main__':raise SystemExit(main())

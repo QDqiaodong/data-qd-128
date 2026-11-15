@@ -203,7 +203,7 @@ class ReconcileCLI(unittest.TestCase):
         foreign=self.dir/'foreign.db';sqlite3.connect(foreign).close()
         r=self.run_cli(foreign,db,1,out);self.assertEqual(r.returncode,2);self.assertIn('not a stream state database',r.stderr)
         badschema=self.make_db('s.db',[('x',1,1)])
-        conn=sqlite3.connect(badschema);conn.execute("UPDATE meta SET value='2' WHERE key='schema'");conn.commit();conn.close()
+        conn=sqlite3.connect(badschema);conn.execute("UPDATE meta SET value='99' WHERE key='schema'");conn.commit();conn.close()
         r=self.run_cli(badschema,db,1,out);self.assertEqual(r.returncode,2);self.assertIn('unsupported state schema',r.stderr)
         for tol in ['-1','x','1.5',str(10**12+1)]:
             self.assertEqual(self.run_cli(da,db,tol,out).returncode,2,tol)

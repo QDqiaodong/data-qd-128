@@ -16,12 +16,16 @@ from bisect import bisect_left, bisect_right
 from itertools import accumulate
 from pathlib import Path
 from urllib.parse import quote
-from .common import number, save
+from .common import number, save, gate, publication_guard
 
 MAX_EVENT_TIME=10**12  # event_time bound from the stream contract; also the tolerance bound
 
 def _snapshot(path):
-    """Read the accepted events of one stream state under a consistent read-only snapshot."""
+    """Read accepted events and the erase epoch of one stream state by consistent snapshot.
+
+    Erased event ids live in `tombstones` and have no `seen` row, so they never
+    join a contribution; schema 1 states have neither table.
+    """
     p=Path(path)
     if not p.exists():raise ValueError('state not initialized: '+str(p))
     conn=sqlite3.connect('file:%s?mode=ro'%quote(str(p.resolve()),safe='/'),uri=True,isolation_level=None)
@@ -30,14 +34,21 @@ def _snapshot(path):
         try:row=conn.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
         except sqlite3.Error:
             raise ValueError('not a stream state database: '+str(p))
-        if row is None or json.loads(row[0])!=1:raise ValueError('unsupported state schema: '+str(p))
+        if row is None or json.loads(row[0]) not in (1,2):
+            raise ValueError('unsupported state schema: '+str(p))
+        schema=json.loads(row[0])
+        epoch_row=conn.execute("SELECT value FROM meta WHERE key='erase_epoch'").fetchone()
+        epoch=0 if epoch_row is None else int(json.loads(epoch_row[0]))
+        # schema 2 keeps erased ids as permanent tombstones: exclude them twice over, both
+        # by the anti-join and because erase deletes the matching contribution atomically
+        tombstone_guard=" AND NOT EXISTS (SELECT 1 FROM tombstones t WHERE t.id=c.id)" if schema>=2 else ""
         events=conn.execute('SELECT c.id, s.event_time, s.value FROM contributions c '
-                            'JOIN seen s ON s.id=c.id ORDER BY c.seq').fetchall()
-        total=conn.execute('SELECT COUNT(*) FROM contributions').fetchone()[0]
+                            'JOIN seen s ON s.id=c.id WHERE 1=1%s ORDER BY c.seq'%tombstone_guard).fetchall()
+        total=conn.execute('SELECT COUNT(*) FROM contributions c WHERE 1=1%s'%tombstone_guard).fetchone()[0]
         if total!=len(events):raise ValueError('corrupt state: contribution without accepted event: '+str(p))
         conn.execute('COMMIT')
     finally:conn.close()
-    return [(eid,moment,value) for eid,moment,value in events]
+    return [(eid,moment,value) for eid,moment,value in events],epoch
 
 def canonical(events):
     """Sort accepted events by (event_time, id); ids are unique per source so the order is total."""
@@ -122,7 +133,7 @@ def match(a,b,tol):
     out.sort()
     return out
 
-def build_report(events_a,events_b,tol):
+def build_report(events_a,events_b,tol,epochs=None):
     """Reconcile two canonical (sorted) event sequences into a report dict."""
     a=[(moment,value) for _,moment,value in events_a]
     b=[(moment,value) for _,moment,value in events_b]
@@ -137,7 +148,7 @@ def build_report(events_a,events_b,tol):
         detail.append({'a_index':i,'b_index':j,'a_id':ea[0],'b_id':eb[0],
                        'event_time_a':ea[1],'event_time_b':eb[1],'value':ea[2],
                        'time_delta':abs(ea[1]-eb[1])})
-    return {'schema_version':1,'tolerance':tol,
+    report={'schema_version':1,'tolerance':tol,
             'objective':{'pair_count':len(pairs),
                          'total_abs_time_delta':sum(p['time_delta'] for p in detail)},
             'sources':{'a':{'accepted_events':len(events_a),'canonical_sha256':canonical_sha256(events_a)},
@@ -145,11 +156,18 @@ def build_report(events_a,events_b,tol):
             'pairs':detail,
             'unmatched_a':[event(events_a,i) for i in range(len(events_a)) if i not in used_a],
             'unmatched_b':[event(events_b,j) for j in range(len(events_b)) if j not in used_b]}
+    if epochs is not None:
+        report['sources']['a']['erase_epoch']=epochs[0]
+        report['sources']['b']['erase_epoch']=epochs[1]
+    return report
 
 def reconcile(db_a,db_b,tol):
+    """Compute the reconciliation report and the snapshot epochs it depends on."""
     number(tol,0,MAX_EVENT_TIME)
-    events_a=canonical(_snapshot(db_a));events_b=canonical(_snapshot(db_b))
-    return build_report(events_a,events_b,tol)
+    events_a,epoch_a=_snapshot(db_a)
+    gate('between-snapshots')
+    events_b,epoch_b=_snapshot(db_b)
+    return build_report(canonical(events_a),canonical(events_b),tol,(epoch_a,epoch_b)),(epoch_a,epoch_b)
 
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='watermark-windows reconcile',description=__doc__.splitlines()[0])
@@ -163,10 +181,15 @@ def main(argv=None):
         out=args.output.resolve()
         if out==args.a.resolve() or out==args.b.resolve():
             raise ValueError('output would overwrite state database')
-        report=reconcile(args.a,args.b,args.tolerance)
-        save(args.output,report)
+        report,epochs=reconcile(args.a,args.b,args.tolerance)
+        gate('snapshot-taken')
+        with publication_guard([(args.a,epochs[0]),(args.b,epochs[1])]):
+            gate('validated')
+            save(args.output,report)
+            gate('saved')
+            print(json.dumps(report,sort_keys=True,ensure_ascii=False,allow_nan=False),flush=True)
     except (ValueError,TypeError,KeyError,OSError,OverflowError,RecursionError,sqlite3.Error) as error:
         print(str(error),file=sys.stderr);return 2
-    print(json.dumps(report,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+    return 0
 
 if __name__=='__main__':raise SystemExit(main())

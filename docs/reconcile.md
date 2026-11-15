@@ -17,13 +17,22 @@ watermark-windows reconcile --a run/a.db --b run/b.db --tolerance 5 --output run
 ## 快照与来源
 
 每个源库以 `mode=ro` 只读打开，在单个读事务内完成全部读取——读到的是事务开始时刻的
-一致快照；读取期间并发 `stream apply` 提交不会造成撕裂（结果要么全旧要么全新，
-取决于快照先于还是后于对方提交）。reconcile 不写源库、不建临时表、不改journal。
+一致快照；读取期间并发 `stream apply`/`stream erase` 提交不会造成撕裂（结果要么全旧要么
+全新，取决于快照先于还是后于对方提交）。reconcile 不写源库、不建临时表、不改journal。
 
 仅纳入 `contributions` 对应的已接受事件（与 `seen` 按id连接）：迟到事件
-（`late_events`）、内容一致的重复ID、offset重传都不产生贡献，一律排除。
-每源将已接受事件按 `(event_time, id)` 排序编号为规范序列（id源内唯一，故序全序确定），
-下标 0..n-1 即报告中的 `a_index/b_index`。
+（`late_events`）、内容一致的重复ID、offset重传都不产生贡献，一律排除。**被`stream erase`
+擦除的事件既无`seen`行也被墓碑排除，绝不出现在规范序列、配对或未配对明细中**；schema 1
+库无擦除概念，等价于epoch 0。每源将已接受事件按 `(event_time, id)` 排序编号为规范序列
+（id源内唯一，故序全序确定），下标 0..n-1 即报告中的 `a_index/b_index`。
+
+## 擦除epoch与发布门控
+
+快照同时读取每个源库的 `erase_epoch`（schema 1为0），写入
+`sources.a.erase_epoch` / `sources.b.erase_epoch`。计算完成后、发布前重新校验两源epoch：
+任一变化即说明快照已被擦除超越，**退出2、不替换报告、不写标准输出**，旧报告逐字节保留。
+校验与“原子替换报告文件→写标准输出”在同一共享文件锁内完成（按解析后的库文件路径加锁，
+路径别名/符号链接同样协调），因此擦除提交不会穿插在发布窗口内；提交方需等发布方完成。
 
 ## 配对规则与双目标
 
@@ -60,7 +69,8 @@ watermark-windows reconcile --a run/a.db --b run/b.db --tolerance 5 --output run
 
 - `schema_version`：恒1；`tolerance`：本次使用的容差。
 - `objective`：`pair_count` 配对数，`total_abs_time_delta` 配对绝对时间差总和。
-- `sources.a/b`：`accepted_events` 规范序列长度，`canonical_sha256` 见上节编码。
+- `sources.a/b`：`accepted_events` 规范序列长度，`canonical_sha256` 见上节编码，
+  `erase_epoch` 该源快照的擦除epoch。
 - `pairs`：按 `a_index` 升序（`b_index` 同为升序）的配对明细，含双边下标、
   双边事件id、双边event_time、value与 `time_delta`。
 - `unmatched_a` / `unmatched_b`：未配对事件，含 `index/id/event_time/value`，按下标升序。

@@ -20,8 +20,14 @@ watermark-windows audit --db run/state.db --plan plan.json --output run/audit.js
 
 状态库以 `mode=ro` 只读打开，在单个读事务内完成全部读取（一致快照，与 reconcile 相同）；
 仅纳入 `contributions` 对应的已接受事件——迟到事件、内容一致的重复ID、offset重传都不
-产生贡献，一律排除。已接受事件按 `(event_time, id)` 排序为规范序列（id库内唯一，序全序
-确定），即报告中的公开事件ID全集顺序。audit 不写状态库、不建临时表、不改journal。
+产生贡献，一律排除。被 `stream erase` 擦除的事件既无 `seen` 行、贡献也被原子删除、并留有
+永久墓碑，因此绝不会出现在公开事件ID全集中。已接受事件按 `(event_time, id)` 排序为规范
+序列（id库内唯一，序全序确定），即报告中的公开事件ID全集顺序。audit 不写状态库、
+不建临时表、不改journal。
+
+快照同时读取 `erase_epoch`（schema 1为0），写入报告 `erase_epoch`。计算完成后、发布前
+重新校验该epoch：变化即退出2、不替换报告、不写标准输出，旧报告保留。校验与
+“原子替换报告文件→写标准输出”在同一共享文件锁内完成，擦除提交必须等发布方完成。
 
 ## 计划格式（plan JSON）
 
@@ -36,8 +42,9 @@ watermark-windows audit --db run/state.db --plan plan.json --output run/audit.js
 - `queries`：至多22个。每个含 `query_id`（非空标识串，查询间唯一）、`cost`
   （正整数，≤10^9）、`event_ids`（数组，内部不重复；允许空数组=零行查询）。
 - `protected_ids`：受保护事件id数组，彼此唯一，至多80个。
-- 查询与保护引用的每个事件id都必须属于该库的已接受事件集；引用未知事件或
-  迟到事件一律失败（退出2）。状态库已接受事件数超过80同样失败。
+- 查询与保护引用的每个事件id都必须属于该库的已接受事件集；引用未知事件、迟到事件或
+  **已擦除事件**一律失败（退出2）——已擦除事件不再公开，其id也不能出现在计划中。
+  状态库已接受事件数超过80同样失败。
 
 ## 公开模型与逐事件判据
 
@@ -82,7 +89,7 @@ watermark-windows audit --db run/state.db --plan plan.json --output run/audit.js
 
 ## 报告字段
 
-- `schema_version`：恒1；`input_sha256`：见上节。
+- `schema_version`：恒1；`input_sha256`：见上节；`erase_epoch`：快照时状态库的擦除epoch。
 - `publication.event_ids`：公开事件ID全集（规范序）。
 - `publication.kept_queries`：保留查询（query_id升序），含 `cost`、`event_ids`
   （计划原序）与 `sum`——即可公开部分。
