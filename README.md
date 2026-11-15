@@ -25,7 +25,8 @@ python3 -m venv .venv
 同输入重跑不累加。测试使用临时目录，运行产物在忽略的run/。
 
 src/watermark_windows/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON及报告发布，
-cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、整批事务、水位推进与报告重建）。fixtures 为明确自制样例，代码与样例采用MIT许可。
+cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、整批事务、水位推进与报告重建）；
+reconcile.py 为跨源对账（只读快照、Hirschberg线性空间双目标配对）。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
 ## 业务与样例结果
 
@@ -46,3 +47,18 @@ cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、整批
 全局水位取活跃分区局部水位最小值，未见事件分区阻塞、全idle不推进、resume不回退。
 apply提交后发布报告；提交后发布前中断时用report仅凭数据库恢复，报告与不中断逐字节一致；结束不flush。
 上述样例批接受5条总和15，水位15，窗口[0,10)按watermark关闭（count2/sum3），[10,20)与[20,30)保持pending。
+
+## 跨源对账（reconcile）
+
+对两个stream状态库做跨源事件对账；原`--source/--output`与`stream`用法不变。
+契约详见 [对账数据契约](docs/reconcile.md)。
+
+```sh
+.venv/bin/watermark-windows reconcile --a run/a.db --b run/b.db --tolerance 5 --output run/reconcile.json
+```
+
+各源取一致只读快照，仅纳入contributions对应的已接受事件（排除late、重复ID与重传），
+按(event_time,id)排序编号。仅value相同且时间差≤tolerance（非负整数）可配对，每条最多一次，
+配对下标双边严格递增；先最大化配对数，再最小化绝对时间差总和，并列最优确定可选、重跑可复现。
+报告含配对明细、双边未配对事件、目标值与各源规范事件序列SHA256；失败退出2并保留旧报告，
+输出不得覆盖源库。不保存n×m表，工作空间O(min(n,m)+log(max(n,m)+1))，配对明细递归重建。
