@@ -1,0 +1,5 @@
+{"partition":"p1","offset":0,"kind":"event","id":"A","event_time":1,"value":2}
+{"partition":"p2","offset":0,"kind":"event","id":"X","event_time":3,"value":1}
+{"partition":"p1","offset":1,"kind":"event","id":"B","event_time":12,"value":3}
+{"partition":"p2","offset":1,"kind":"event","id":"Y","event_time":20,"value":5}
+{"partition":"p1","offset":2,"kind":"event","id":"C","event_time":25,"value":4}

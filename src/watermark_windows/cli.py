@@ -9,6 +9,9 @@ def run(source):
     return {'schema_version':1,'source_sha256':digest,'result':analyze(data)}
 
 def main():
+    if sys.argv[1:2]==['stream']:
+        from . import stream
+        raise SystemExit(stream.main(sys.argv[2:]))
     parser=argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument('--source',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
