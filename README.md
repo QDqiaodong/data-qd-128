@@ -26,7 +26,8 @@ python3 -m venv .venv
 
 src/watermark_windows/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON及报告发布，
 cli.py 衔接数据链路；stream.py 为分区增量流（SQLite状态、整批事务、水位推进与报告重建）；
-reconcile.py 为跨源对账（只读快照、Hirschberg线性空间双目标配对）。fixtures 为明确自制样例，代码与样例采用MIT许可。
+reconcile.py 为跨源对账（只读快照、Hirschberg线性空间双目标配对）；
+audit.py 为内部发布审计（只读快照、精确秩分支定界最小损失抑制）。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
 ## 业务与样例结果
 
@@ -62,3 +63,23 @@ apply提交后发布报告；提交后发布前中断时用report仅凭数据库
 配对下标双边严格递增；先最大化配对数，再最小化绝对时间差总和，并列最优确定可选、重跑可复现。
 报告含配对明细、双边未配对事件、目标值与各源规范事件序列SHA256；失败退出2并保留旧报告，
 输出不得覆盖源库。不保存n×m表，工作空间O(min(n,m)+log(max(n,m)+1))，配对明细递归重建。
+
+## 内部发布审计（audit）
+
+对一个stream状态库做内部发布审计：判定汇总查询计划下每个受保护事件的单笔value是否可识别，
+并选出损失最小的抑制方案；原`--source/--output`、`stream`与`reconcile`用法不变。
+契约详见 [审计数据契约](docs/audit.md)。
+
+```sh
+.venv/bin/watermark-windows audit --db run/state.db --plan fixtures/audit/plan.json --output run/audit.json
+```
+
+从stream库一致只读快照取contributions已接受事件（排除late、重复ID与重传），按(event_time,id)
+规范排序为公开事件ID全集。计划JSON含queries（query_id、正整数cost、不重复event_ids）与
+protected_ids，查询/保护ID各自唯一，引用未知或迟到事件失败；至多80事件、22查询。
+发布模型：公开事件ID全集、保留查询成员及sum，抑制查询sum不公开；单笔value为无界有理未知数。
+受保护事件被泄露当且仅当其单位向量落在保留矩阵行空间。内部报告给出原计划逐事件证书
+（可识别：查询系数c使cA=e_i及推出值；否则核证书d使Ad=0、d_i=1）、最小cost抑制方案
+（同价取升序query_id列表字典序最小）与保留矩阵下逐事件核证书，证书系数为既约p/q，
+并含规范输入SHA256；重跑逐字节一致。失败退出2并保留旧报告，输出不得覆盖状态库或计划文件。
+样例计划中A可由q1-q2推出（推出值2），审计抑制损失最小的q2（cost 1）后A不可识别。

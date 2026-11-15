@@ -1,0 +1,31 @@
+{
+  "queries": [
+    {
+      "query_id": "q1",
+      "cost": 2,
+      "event_ids": [
+        "A",
+        "X"
+      ]
+    },
+    {
+      "query_id": "q2",
+      "cost": 1,
+      "event_ids": [
+        "X"
+      ]
+    },
+    {
+      "query_id": "q3",
+      "cost": 4,
+      "event_ids": [
+        "B",
+        "Y",
+        "C"
+      ]
+    }
+  ],
+  "protected_ids": [
+    "A"
+  ]
+}
